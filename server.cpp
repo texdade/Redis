@@ -3,12 +3,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <vector>
+#include <poll.h>
 
 const size_t MAX_REQUEST_SIZE = 4096;
+enum {
+    STATE_REQ = 0,
+    STATE_RES = 1,
+    STATE_END = 2,
+};
+
+struct Connection{
+    int socket = -1;
+    uint32_t state = STATE_REQ;
+    size_t rBuffSize = 0;
+    uint8_t rBuff[4 + MAX_REQUEST_SIZE];
+    size_t wBuffSize = 0;
+    size_t wBuffSent = 0;
+    uint8_t wBuff[4 + MAX_REQUEST_SIZE];
+};
 
 void doStuff(int connection)
 {
@@ -107,54 +125,83 @@ int32_t getRequest(int server)
     return writeSpecificSize(server, wBuff, 4 + len);
 }
 
+void setNonBlockingServer(int server)
+{
+    //get current flags
+    int flags = fcntl(server, F_GETFL, 0);
+    if (flags == -1) {
+        abort();
+    }
+
+    //set non blocking
+    flags |= O_NONBLOCK;
+    int s = fcntl(server, F_SETFL, flags);
+    if (s == -1) {
+        abort();
+    }
+}
+
 int main() {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server < 0) {
-        abort();
-    }
-    int  val = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-
-    struct sockaddr_in serverAddr = {};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(1234);
-    serverAddr.sin_addr.s_addr = ntohl(0);
-
-    int bindC = bind(server, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-
-    if(bindC)
-    {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
         abort();
     }
 
-    //start listening
-    bindC = listen(server, SOMAXCONN);
-    if(bindC)
-    {
-        abort();
-    }
+    //vector of all connections
+    std::vector<Connection*> connections;
 
+    //set non blocking
+    setNonBlockingServer(sock);
+
+    std::vector<struct pollfd> pollArgs;
+    
+    //event loop!
     while(true)
     {
-        struct sockaddr_in clientAddr = {};
-        socklen_t clientAddrSize = sizeof(clientAddr);
-        int connection = accept(server, (struct sockaddr*)&clientAddr, &clientAddrSize);
-        if(connection < 0)
+        pollArgs.clear();
+        pollArgs.push_back({sock, POLLIN, 0});
+
+        for(Connection* connection : connections)
         {
-            //current connection is broken, start listening again
-            continue;
+            if(!connection)
+            {
+                continue;
+            }
+
+            //set up all the right flags based on status of the connection
+            struct pollfd poll = {};
+            poll.fd = connection->socket;
+            poll.events = (connection->state == STATE_REQ) ? POLLIN : POLLOUT;
+            poll.events = poll.events | POLLERR | POLLHUP;
+            pollArgs.push_back(poll);
         }
 
-        while(true)
+        //poll for active connections
+        int err = poll(pollArgs.data(), pollArgs.size(), -1);
+        if(err < 0)
         {
-            int32_t status = getRequest(connection);
-            if(status)
+            abort();
+        }
+
+        //process
+        for(const pollfd& pfd : pollArgs)
+        {
+            if(pfd.revents)
             {
-                break;
+                Connection* connection = connections[pfd.fd];
+                // TODO: handle io
+                if(connection->state == STATE_END)
+                {
+                    connections[pfd.fd] = nullptr;
+                    close(pfd.fd);
+                    free(connection);
+                }
             }
         }
 
-        doStuff(connection);
-        close(connection);
+        if(pollArgs[0].revents & POLLIN)
+        {
+            //TODO: accept new connection
+        }
     }
 }
